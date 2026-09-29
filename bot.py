@@ -450,16 +450,17 @@ def main():
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
     Thread(
-        target=lambda: app.run(host="0.0.0.0", port=8080, use_reloader=False),
+        target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
         daemon=True,
     ).start()
 
+    import time
     while True:
         try:
-            asyncio.run(main())
-        except Exception as e:
+            asyncio.set_event_loop(asyncio.new_event_loop())  # fresh loop each attempt
+            main()
+        except Exception:
             logger.exception("Bot crashed, restarting in 5 seconds...")
-            import time
-
             time.sleep(5)
