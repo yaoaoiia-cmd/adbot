@@ -402,7 +402,7 @@ async def show_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     # Bot token from environment or set directly
-    TOKEN = "8738394002:AAHHYwnbCFUvBeDXabWQ4-mnaTXSVIMp4XU"
+    TOKEN = "8738394002:AAGBC4UmO6bDvnxQiOvoNhTZ1i40RUXpf40"
 
     app = Application.builder().token(TOKEN).build()
 
