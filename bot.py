@@ -554,12 +554,7 @@ async def run_single_account_broadcast(phone):
             await asyncio.sleep(30)
 
 # --- STARTUP ---
-
 async def main():
-    flask_thread = threading.Thread(target=run_flask_server, daemon=True)
-    flask_thread.start()
-    print("Flask Web Server started on background thread.")
-
     # Reconnect stored user accounts
     account_credentials = app_data.get("account_credentials", {})
     default_api_id = app_data.get("api_id") or DEFAULT_BOT_API_ID
@@ -586,17 +581,18 @@ async def main():
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    import time
+    port = int(os.environ.get("PORT", 10000))
     Thread(
         target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
         daemon=True,
     ).start()
+    print(f"Flask Web Server started on port {port}.")
 
-    import time
     while True:
         try:
-            asyncio.set_event_loop(asyncio.new_event_loop())  # fresh loop each attempt
-            main()
-        except Exception:
-            logger.exception("Bot crashed, restarting in 5 seconds...")
+            asyncio.run(main())
+        except Exception as e:
+            print(f"Bot crashed: {e}, restarting in 5 seconds...")
             time.sleep(5)
+
