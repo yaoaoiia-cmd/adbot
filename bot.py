@@ -13,7 +13,7 @@ from telethon.errors import (
 )
 
 # --- FLASK WEB SERVER ---
-app = Flask(name)
+app = Flask(__name__)
 @app.route("/")
 def home():
     return "Bot is alive"
