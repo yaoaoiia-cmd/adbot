@@ -2,7 +2,7 @@ import os
 import json
 import random
 import asyncio
-import threading
+from threading import Thread
 from flask import Flask
 from telethon import TelegramClient, events, Button
 from telethon.errors import (
