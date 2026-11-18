@@ -21,7 +21,7 @@ def home():
 # --- CONFIGURATION & STORAGE ---
 # Only BOT_TOKEN and ADMIN_ID are required as environment variables.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "0").strip()
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "8661093859").strip()
 ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else 0
 
 SESSIONS_DIR = "sessions"
