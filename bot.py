@@ -1,453 +1,589 @@
-import asyncio
-import logging
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ConversationHandler,
-    ContextTypes,
-)
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
-import shutil
-
+import json
+import random
+import asyncio
+import threading
 from flask import Flask
-from threading import Thread
+from telethon import TelegramClient, events, Button
+from telethon.errors import (
+    FloodWaitError, 
+    SessionPasswordNeededError, 
+    AuthRestartError,
+    MessageNotModifiedError
+)
 
-app = Flask(__name__)
-
-
+# --- FLASK WEB SERVER ---
+app = Flask(name)
 @app.route("/")
 def home():
     return "Bot is alive"
 
+# --- CONFIGURATION & STORAGE ---
+# Only BOT_TOKEN and ADMIN_ID are required as environment variables.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "0").strip()
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else 0
 
-from storage import load_data, save_data
-from poster import start_posting, stop_posting_loop
+SESSIONS_DIR = "sessions"
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+DATA_FILE = "config_data.json"
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app_data = {
+    "api_id": None,
+    "api_hash": None,
+    "min_delay": 30,
+    "max_delay": 60,
+    "cycle_interval": 60,
+    "broadcast_msg": "",
+    "account_groups": {},
+    "account_credentials": {}  # {phone: {"api_id": ..., "api_hash": ...}}
+}
 
-# Conversation states for adding account
-(API_ID, API_HASH, PHONE, CODE, PASSWORD) = range(5)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Welcome! \nUse /add_account to add a Telegram account.\n"
-        "Use /add_group to add a group (public @username or private invite link).\n"
-        "Use /remove_group to remove a group (Enter public uername or private link.\n)"
-        "Use /set_post to set the advertisement post (send a message with media).\n"
-        "Use /start_posting to begin the ad loop.\n"
-        "Use /stop_posting to stop the loop.\n"
-        "Use /status to see current data.\n"
-        "Use /show_post to see the current post."
-    )
-
-
-async def add_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Please send your API ID (integer):")
-    return API_ID
-
-
-async def add_account_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data["api_id"] = int(update.message.text)
-        await update.message.reply_text("Now send your API hash:")
-        return API_HASH
-    except ValueError:
-        await update.message.reply_text("Invalid API ID. Please send an integer.")
-        return API_ID
-
-
-async def add_account_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["api_hash"] = update.message.text.strip()
-    await update.message.reply_text(
-        "Now send your phone number (with country code, e.g., +1234567890):"
-    )
-    return PHONE
-
-
-async def add_account_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    context.user_data["phone"] = phone
-    api_id = context.user_data["api_id"]
-    api_hash = context.user_data["api_hash"]
-
-    # Create a temporary client to send code
-    client = TelegramClient(StringSession(), api_id, api_hash)
-    await client.connect()
-    try:
-        await client.send_code_request(phone)
-        context.user_data["temp_client"] = client
-        await update.message.reply_text(
-            "A verification code has been sent. Please send it (or /cancel to abort)."
-        )
-        return CODE
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}. Please try again.")
-        return ConversationHandler.END
-
-
-async def add_account_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code = update.message.text.strip()
-    client = context.user_data.get("temp_client")
-    if not client:
-        await update.message.reply_text(
-            "Session expired. Start over with /add_account."
-        )
-        return ConversationHandler.END
-
-    try:
-        await client.sign_in(phone=context.user_data["phone"], code=code)
-        # Save session string
-        session_string = client.session.save()
-        # Store account
-        data = load_data()
-        data["accounts"].append(
-            {
-                "api_id": context.user_data["api_id"],
-                "api_hash": context.user_data["api_hash"],
-                "phone": context.user_data["phone"],
-                "session_string": session_string,
-            }
-        )
-        save_data(data)
-        await update.message.reply_text("Account added successfully!")
-        await client.disconnect()
-        return ConversationHandler.END
-    except SessionPasswordNeededError:
-        await update.message.reply_text(
-            "Two-factor authentication is enabled. Please send your password:"
-        )
-        return PASSWORD
-    except Exception as e:
-        await update.message.reply_text(f"Failed to sign in: {e}")
-        return ConversationHandler.END
-
-
-async def add_account_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    password = update.message.text.strip()
-    client = context.user_data.get("temp_client")
-    if not client:
-        await update.message.reply_text("Session expired. Start over.")
-        return ConversationHandler.END
-
-    try:
-        await client.sign_in(password=password)
-        session_string = client.session.save()
-        data = load_data()
-        data["accounts"].append(
-            {
-                "api_id": context.user_data["api_id"],
-                "api_hash": context.user_data["api_hash"],
-                "phone": context.user_data["phone"],
-                "session_string": session_string,
-            }
-        )
-        save_data(data)
-        await update.message.reply_text("Account added successfully!")
-        await client.disconnect()
-        return ConversationHandler.END
-    except Exception as e:
-        await update.message.reply_text(f"Failed: {e}")
-        return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()  # optional cleanup
-    await update.message.reply_text("Operation cancelled.")
-    return ConversationHandler.END
-
-
-async def add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add one or more groups by username or private invite link (space-            separated)."""
-    text = update.message.text or ""
-    if text.startswith("/add_group"):
-        text = text[len("/add_group") :].strip()
-    if not text:
-        await update.message.reply_text(
-            "Please provide at least one group identifier.\n"
-            "Example: /add_group @group1 https://t.me/+abc @group2"
-        )
-        return
-
-    # Split by spaces to get multiple identifiers
-    identifiers = text.split()
-    data = load_data()
-
-    if not data.get("accounts"):
-        await update.message.reply_text("No accounts available. Add an account first.")
-        return
-
-    # Use the first account to resolve entities
-    acc = data["accounts"][0]
-    client = TelegramClient(
-        StringSession(acc["session_string"]), int(acc["api_id"]), acc["api_hash"]
-    )
-    await client.connect()
-
-    results = []
-    for identifier in identifiers:
+def load_data():
+    global app_data
+    if os.path.exists(DATA_FILE):
         try:
-            entity = await client.get_entity(identifier)
-            chat_id = entity.id
-            group_entry = {
-                "name": entity.title if hasattr(entity, "title") else identifier,
-                "chat_id": chat_id,
-                "identifier": identifier,
-            }
-            # Check for duplicates
-            if any(
-                g["identifier"] == identifier or g["chat_id"] == chat_id
-                for g in data["groups"]
-            ):
-                results.append(f"⚠️ Group '{identifier}' already exists.")
-                continue
-
-            data["groups"].append(group_entry)
-            save_data(data)  # save after each successful addition
-            results.append(f"✅ Added: {group_entry['name']} ({identifier})")
+            with open(DATA_FILE, "r") as f:
+                loaded = json.load(f)
+                app_data.update(loaded)
         except Exception as e:
-            results.append(f"❌ Failed to add '{identifier}': {e}")
+            print(f"Error loading config file: {e}")
 
-    await client.disconnect()
+def save_data():
+    with open(DATA_FILE, "w") as f:
+        json.dump(app_data, f, indent=4)
 
-    # Send summary
-    await update.message.reply_text(
-        "\n".join(results) if results else "No groups processed."
-    )
+load_data()
 
+# Fallback default API credentials (official Telegram test credentials)
+# Used only to initialize Telethon bot connection without breaking startup
+DEFAULT_BOT_API_ID = 6
+DEFAULT_BOT_API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
 
-async def remove_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove a group by its public username, private invite link, or chat ID."""
-    text = update.message.text or ""
-    if text.startswith("/remove_group"):
-        text = text[len("/remove_group") :].strip()
-    if not text:
-        await update.message.reply_text(
-            "Please provide the group identifier (e.g., @mygroup, https://t.me/+, or chat ID)."
-        )
-        return
+bot_api_id = app_data.get("api_id") or DEFAULT_BOT_API_ID
+bot_api_hash = app_data.get("api_hash") or DEFAULT_BOT_API_HASH
 
-    data = load_data()
-    groups = data.get("groups", [])
-    removed = False
-    new_groups = []
+bot = TelegramClient('control_bot', bot_api_id, bot_api_hash, auto_reconnect=True)
+user_clients = {}  
+login_states = {}
 
-    for group in groups:
-        # Match by identifier or chat_id (converted to string)
-        identifier = group.get("identifier", "")
-        chat_id_str = str(group.get("chat_id", ""))
-        if identifier == text or chat_id_str == text:
-            removed = True
-            continue
-        new_groups.append(group)
+active_broadcasts = {}  # {phone: True/False}
+broadcast_tasks = {}    # {phone: asyncio.Task}
 
-    if removed:
-        data["groups"] = new_groups
-        save_data(data)
-        await update.message.reply_text(
-            f"✅ Group matching '{text}' removed successfully."
-        )
-    else:
-        await update.message.reply_text(f"❌ No group found matching '{text}'.")
+# --- ADMIN BOT CONTROL PANEL ---
 
+@bot.on(events.NewMessage(pattern='/start', chats=ADMIN_ID))
+async def start_handler(event):
+    min_d = app_data.get('min_delay', 30)
+    max_d = app_data.get('max_delay', 60)
+    cycle_interval = app_data.get('cycle_interval', 60)
+    msg_text = app_data.get('broadcast_msg', 'Not set')
+    default_api_set = "Configured" if (app_data.get("api_id") and app_data.get("api_hash")) else "Using Default"
 
-async def json_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send the current data.json file as a document for backup."""
-    # Optional: restrict to a specific admin user ID
-    # ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-    # if update.effective_user.id != ADMIN_ID:
-    #     await update.message.reply_text("⛔ You are not authorized to use this command.")
-    #     return
+    text = f"""
+Multi-Account Independent Broadcaster
 
-    data_file = "data.json"
-    if not os.path.exists(data_file):
-        await update.message.reply_text("❌ data.json file not found.")
-        return
+Global Settings:
+• Telegram API Credentials: {default_api_set}
+• Group Gap: {min_d}-{max_d} Random Seconds
+• Cycle Repeat: {cycle_interval} Minutes
+• Broadcast Message: {msg_text[:35] if msg_text else 'Not set'}
+• Logged-In Accounts: {len(user_clients)}
 
-    try:
-        with open(data_file, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename="data.json",
-                caption="📦 Current data backup – includes all accounts, groups, and post settings.",
+Select an option below to configure or manage:
+"""
+    buttons = [
+        [Button.inline("Add Account", b"add_acc"), Button.inline("Manage Accounts & Groups", b"manage_accs")],
+        [Button.inline("Set Delay Range (Sec)", b"set_delay"), Button.inline("Set Cycle Repeat (Min)", b"set_cycle")],
+        [Button.inline("Set Message", b"set_msg"), Button.inline("Set Default API ID/Hash", b"set_api")]
+    ]
+    await event.respond(text, buttons=buttons)
+
+@bot.on(events.CallbackQuery(chats=ADMIN_ID))
+async def callback_handler(event):
+    data = event.data
+
+    if data == b"add_acc":
+        if not app_data.get("api_id") or not app_data.get("api_hash"):
+            login_states[ADMIN_ID] = {'step': 'ask_api_id'}
+            await event.respond(
+                "Telegram API Credentials Needed\n\n"
+                "Please send the API ID for this account (from my.telegram.org):\n"
+                "(Or send /default to use standard default credentials)"
             )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error sending file: {e}")
+        else:
+            login_states[ADMIN_ID] = {
+                'step': 'phone',
+                'api_id': app_data["api_id"],
+                'api_hash': app_data["api_hash"]
+            }
+            await event.respond("Send Account Phone Number with Country Code (e.g. +919876543210):")
 
+    elif data == b"set_api":
+        login_states[ADMIN_ID] = {'step': 'set_default_api_id'}
+        await event.respond("Send the Default API ID for all future accounts (from my.telegram.org):")
 
-async def set_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start the process of setting the post. If text is provided as argument, use it immediately."""
-    # If text is given with the command, use it directly
-    text = update.message.text or ""
-    if text.startswith("/set_post"):
-        text = text[len("/set_post") :].strip()
-    if text:
-        data = load_data()
-        data["post"] = {"text": text}
-        save_data(data)
-        await update.message.reply_text("Post text saved successfully! (No media)")
-        return
+    elif data == b"set_delay":
+        login_states[ADMIN_ID] = {'step': 'set_delay'}
+        await event.respond("Send Min and Max delay in seconds separated by space (e.g., 30 60):")
 
-    # Otherwise, ask for the content
-    context.user_data["awaiting_post"] = True
-    await update.message.reply_text(
-        "Please send the post content now. You can include text and/or media (photo, video, document). "
-        "Send /cancel to abort."
-    )
+    elif data == b"set_cycle":
+        login_states[ADMIN_ID] = {'step': 'set_cycle'}
+        await event.respond("Enter cycle repeat interval in minutes (e.g. 60):")
 
+    elif data == b"set_msg":
+        login_states[ADMIN_ID] = {'step': 'set_msg'}
+        await event.respond("Send Broadcast Message text:")
 
-async def handle_post_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Capture the user's message as the post (text + optional media)."""
-    # If not expecting a post, let other handlers process the message
-    if not context.user_data.get("awaiting_post"):
-        return False  # ← this tells PTB to continue to next handlers
+    elif data == b"manage_accs":
+        if not user_clients:
+            await event.respond("Pehle kam se kam 1 user account add karein!")
+            return
+        
+        buttons = []
+        for phone in user_clients.keys():
+            status = "RUNNING" if active_broadcasts.get(phone, False) else "STOPPED"
+            selected_count = len(app_data["account_groups"].get(phone, []))
+            buttons.append([Button.inline(f"{phone} | {status} ({selected_count} Grps)", f"acc_menu_{phone}".encode())])
+        
+        buttons.append([Button.inline("Back to Main Menu", b"back_main")])
+        await event.respond("Select an account to start/stop broadcast or edit groups:", buttons=buttons)
 
-    msg = update.message
-    if not msg:
-        await update.message.reply_text("Invalid message.")
-        return
+    elif data == b"back_main":
+        await start_handler(event)
 
-    data = load_data()
-    post_data = {"text": msg.caption or msg.text or ""}
+    elif data.startswith(b"acc_menu_"):
+        phone = data.decode().replace("acc_menu_", "")
+        await render_account_dashboard(event, phone, edit=True)
 
-    # Download media if present
-    if msg.photo:
-        file = await msg.photo[-1].get_file()
-        file_path = f"media/{file.file_id}.jpg"
-        os.makedirs("media", exist_ok=True)
-        await file.download_to_drive(file_path)
-        post_data["media_path"] = file_path
-    elif msg.document or msg.video or msg.audio or msg.animation:
-        file_obj = msg.document or msg.video or msg.audio or msg.animation
-        file = await file_obj.get_file()
-        ext = file.file_path.split(".")[-1] if file.file_path else "bin"
-        file_path = f"media/{file.file_id}.{ext}"
-        os.makedirs("media", exist_ok=True)
-        await file.download_to_drive(file_path)
-        post_data["media_path"] = file_path
+    elif data.startswith(b"start_acc_"):
+        phone = data.decode().replace("start_acc_", "")
+        if active_broadcasts.get(phone, False):
+            await event.answer("This account is already broadcasting!", alert=True)
+            return
 
-    data["post"] = post_data
-    save_data(data)
-    context.user_data["awaiting_post"] = False
-    await update.message.reply_text("Post saved successfully!")
+        if not app_data.get('broadcast_msg'):
+            await event.respond("Broadcast message set nahi hai! Pehle message set karein.")
+            return
 
+        if not app_data["account_groups"].get(phone, []):
+            await event.respond("Is account ke liye koi groups select nahi hain!")
+            return
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    accounts = data.get("accounts", [])
-    groups = data.get("groups", [])
-    post = data.get("post")
-    text = f"Accounts: {len(accounts)}\nGroups: {len(groups)}\nPost: {'Set' if post else 'Not set'}"
-    await update.message.reply_text(text)
+        active_broadcasts[phone] = True
+        task = asyncio.create_task(run_single_account_broadcast(phone))
+        broadcast_tasks[phone] = task
 
+        await event.answer(f"Broadcast started for {phone}!", alert=True)
+        await render_account_dashboard(event, phone, edit=True)
 
-async def start_posting_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    if not data["accounts"] or not data["groups"] or not data["post"]:
-        await update.message.reply_text("Missing accounts, groups, or post. Cannot start.")
-        return
-    from poster import set_report_chat_id
-    set_report_chat_id(update.effective_chat.id)
-    start_posting()
-    await update.message.reply_text("Posting loop started. Stats will be sent after each cycle.")
+    elif data.startswith(b"stop_acc_"):
+        phone = data.decode().replace("stop_acc_", "")
+        if not active_broadcasts.get(phone, False):
+            await event.answer("This account is not running!", alert=True)
+            return
 
+        active_broadcasts[phone] = False
+        if phone in broadcast_tasks:
+            broadcast_tasks[phone].cancel()
+            del broadcast_tasks[phone]
 
-async def stop_posting_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stop_posting_loop()
-    await update.message.reply_text("Posting loop stopping (after current cycle).")
+        await event.answer(f"Broadcast stopped for {phone}!", alert=True)
+        await render_account_dashboard(event, phone, edit=True)
 
+    elif data.startswith(b"sel_acc_"):
+        phone = data.decode().replace("sel_acc_", "")
+        await render_group_selection(event, phone, page=0)
 
-async def show_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    post = data.get("post")
-    if not post:
-        await update.message.reply_text("No post has been set yet.")
-        return
+    elif data.startswith(b"grp_page_"):
+        parts = data.decode().replace("grp_page_", "").rsplit("_", 1)
+        phone = parts[0]
+        page = int(parts[1])
+        await render_group_selection(event, phone, page=page, edit=True)
 
-    text = post.get("text", "")
-    media_path = post.get("media_path")
+    elif data.startswith(b"toggle_g_"):
+        parts = data.decode().replace("toggle_g_", "").rsplit("_", 2)
+        phone = parts[0]
+        group_id = int(parts[1])
+        page = int(parts[2])
 
-    if not media_path or not os.path.exists(media_path):
-        await update.message.reply_text(
-            text if text else "(Empty post – no media found)"
-        )
-        return
+        if phone not in app_data["account_groups"]:
+            app_data["account_groups"][phone] = []
 
-    # Determine file type from extension
-    ext = os.path.splitext(media_path)[1].lower()
+        if group_id in app_data["account_groups"][phone]:
+            app_data["account_groups"][phone].remove(group_id)
+        else:
+            app_data["account_groups"][phone].append(group_id)
+
+        save_data()
+        await render_group_selection(event, phone, page=page, edit=True)
+
+    elif data.startswith(b"sel_all_"):
+        parts = data.decode().replace("sel_all_", "").rsplit("_", 1)
+        phone = parts[0]
+        page = int(parts[1])
+        
+        client = user_clients.get(phone)
+        if client:
+            dialogs = await client.get_dialogs()
+            all_g_ids = [d.id for d in dialogs if d.is_group]
+            app_data["account_groups"][phone] = list(set(app_data["account_groups"].get(phone, []) + all_g_ids))
+            save_data()
+        
+        await render_group_selection(event, phone, page=page, edit=True)
+
+    elif data.startswith(b"desel_all_"):
+        parts = data.decode().replace("desel_all_", "").rsplit("_", 1)
+        phone = parts[0]
+        page = int(parts[1])
+
+        app_data["account_groups"][phone] = []
+        save_data()
+
+        await render_group_selection(event, phone, page=page, edit=True)
+
+async def render_account_dashboard(event, phone, edit=False):
+    is_running = active_broadcasts.get(phone, False)
+    status_str = "RUNNING" if is_running else "STOPPED"
+    grp_count = len(app_data["account_groups"].get(phone, []))
+
+    text = f"""
+Account Dashboard: {phone}
+
+• Status: {status_str}
+• Selected Groups: {grp_count}
+"""
+    buttons = []
+    if is_running:
+        buttons.append([Button.inline("STOP Broadcast", f"stop_acc_{phone}".encode())])
+    else:
+        buttons.append([Button.inline("START Broadcast", f"start_acc_{phone}".encode())])
+
+    buttons.append([Button.inline("Select / Manage Groups", f"sel_acc_{phone}".encode())])
+    buttons.append([Button.inline("Back to Accounts List", b"manage_accs")])
+
     try:
-        with open(media_path, "rb") as f:
-            if ext in [".jpg", ".jpeg", ".png", ".webp"]:
-                await update.message.reply_photo(photo=f, caption=text)
-            elif ext in [".mp4", ".mov", ".avi"]:
-                await update.message.reply_video(video=f, caption=text)
-            elif ext in [".gif"]:
-                await update.message.reply_animation(animation=f, caption=text)
-            elif ext in [".mp3", ".wav", ".ogg"]:
-                await update.message.reply_audio(audio=f, caption=text)
-            else:
-                # Fallback to document for unknown types
-                await update.message.reply_document(document=f, caption=text)
+        if edit:
+            await event.edit(text, buttons=buttons)
+        else:
+            await event.respond(text, buttons=buttons)
+    except MessageNotModifiedError:
+        pass
+
+async def render_group_selection(event, phone, page=0, edit=False):
+    client = user_clients.get(phone)
+    if not client:
+        await event.respond("Account session active nahi hai.")
+        return
+
+    try:
+        dialogs = await client.get_dialogs()
+        groups = [d for d in dialogs if d.is_group]
+        selected_ids = app_data["account_groups"].get(phone, [])
+
+        PER_PAGE = 10
+        total_groups = len(groups)
+        total_pages = (total_groups + PER_PAGE - 1) // PER_PAGE if total_groups > 0 else 1
+
+        if page < 0:
+            page = 0
+        elif page >= total_pages:
+            page = total_pages - 1
+
+        start_idx = page * PER_PAGE
+        end_idx = start_idx + PER_PAGE
+        current_groups = groups[start_idx:end_idx]
+
+        buttons = []
+        buttons.append([
+            Button.inline("Select All", f"sel_all_{phone}_{page}".encode()),
+            Button.inline("Deselect All", f"desel_all_{phone}_{page}".encode())
+        ])
+
+        for g in current_groups:
+            status = "[v]" if g.id in selected_ids else "[x]"
+            title = (g.title[:25] + '..') if len(g.title) > 25 else g.title
+            buttons.append([Button.inline(f"{status} {title}", f"toggle_g_{phone}_{g.id}_{page}".encode())])
+
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(Button.inline("Previous", f"grp_page_{phone}_{page-1}".encode()))
+        if page < total_pages - 1:
+            nav_buttons.append(Button.inline("Next", f"grp_page_{phone}_{page+1}".encode()))
+        
+        if nav_buttons:
+            buttons.append(nav_buttons)
+
+        buttons.append([Button.inline("Back to Account Menu", f"acc_menu_{phone}".encode())])
+
+        text = f"Select Groups for Account {phone}\nPage {page+1} of {total_pages} (Total Groups: {total_groups})"
+        
+        if edit:
+            try:
+                await event.edit(text, buttons=buttons)
+            except MessageNotModifiedError:
+                await event.answer("Updated")
+        else:
+            await event.respond(text, buttons=buttons)
     except Exception as e:
-        await update.message.reply_text(f"Error sending preview: {e}")
+        await event.respond(f"Error fetching groups: {e}")
 
+# --- TEXT INPUT HANDLER ---
 
-def main():
-    # Bot token from environment or set directly
-    TOKEN = "8738394002:AAGBC4UmO6bDvnxQiOvoNhTZ1i40RUXpf40"
+@bot.on(events.NewMessage(chats=ADMIN_ID))
+async def input_handler(event):
+    if ADMIN_ID not in login_states:
+        return
 
-    app = Application.builder().token(TOKEN).build()
+    state = login_states[ADMIN_ID]
+    step = state.get('step')
+    text = event.text.strip()
 
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add_group", add_group))
-    app.add_handler(CommandHandler("remove_group", remove_group))
-    app.add_handler(CommandHandler("set_post", set_post))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("start_posting", start_posting_cmd))
-    app.add_handler(CommandHandler("stop_posting", stop_posting_cmd))
-    app.add_handler(CommandHandler("json", json_export))
-    app.add_handler(CommandHandler("show_post", show_post))
-    # Conversation for adding account
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("add_account", add_account_start)],
-        states={
-            API_ID: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_api_id)
-            ],
-            API_HASH: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_api_hash)
-            ],
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_phone)],
-            CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_code)],
-            PASSWORD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_password)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(conv_handler)
-    app.add_handler(
-        MessageHandler(
-            (filters.TEXT & ~filters.COMMAND)
-            | filters.PHOTO
-            | filters.Document.ALL
-            | filters.VIDEO
-            | filters.AUDIO,
-            handle_post_content,
-        )
-    )
-    logger.info("Bot started")
-    app.run_polling()
+    # Flow: Setting Default API ID & Hash
+    if step == 'set_default_api_id':
+        if not text.isdigit():
+            await event.respond("Invalid API ID. Must be numeric. Try again:")
+            return
+        state['api_id'] = int(text)
+        state['step'] = 'set_default_api_hash'
+        await event.respond("Now send the API Hash:")
 
+    elif step == 'set_default_api_hash':
+        app_data['api_id'] = state['api_id']
+        app_data['api_hash'] = text
+        save_data()
+        del login_states[ADMIN_ID]
+        await event.respond("Default API ID and API Hash saved successfully!")
+
+    # Flow: Setting Account-specific or Prompted API Credentials
+    elif step == 'ask_api_id':
+        if text == '/default':
+            state['api_id'] = DEFAULT_BOT_API_ID
+            state['api_hash'] = DEFAULT_BOT_API_HASH
+            state['step'] = 'phone'
+            await event.respond("Send Account Phone Number with Country Code (e.g. +919876543210):")
+        else:
+            if not text.isdigit():
+                await event.respond("API ID must be numbers only. Send valid API ID or /default:")
+                return
+            state['api_id'] = int(text)
+            state['step'] = 'ask_api_hash'
+            await event.respond("Now send the API Hash:")
+
+    elif step == 'ask_api_hash':
+        state['api_hash'] = text
+        state['step'] = 'phone'
+        await event.respond("Send Account Phone Number with Country Code (e.g. +919876543210):")
+
+    # Flow: Account Login
+    elif step == 'phone':
+        phone = text
+        api_id = state.get('api_id') or app_data.get('api_id') or DEFAULT_BOT_API_ID
+        api_hash = state.get('api_hash') or app_data.get('api_hash') or DEFAULT_BOT_API_HASH
+
+        session_file = os.path.join(SESSIONS_DIR, f"acc_{phone.replace('+', '')}")
+        
+        if os.path.exists(f"{session_file}.session"):
+            try:
+                os.remove(f"{session_file}.session")
+            except Exception:
+                pass
+
+        client = TelegramClient(session_file, api_id, api_hash, auto_reconnect=True)
+        await client.connect()
+
+        for attempt in range(2):
+            try:
+                res = await client.send_code_request(phone)
+                login_states[ADMIN_ID] = {
+                    'step': 'code', 
+                    'client': client, 
+                    'phone': phone, 
+                    'hash': res.phone_code_hash,
+                    'api_id': api_id,
+                    'api_hash': api_hash
+                }
+                await event.respond("Enter Telegram Login OTP Code:")
+                break
+            except AuthRestartError:
+                await client.disconnect()
+                await asyncio.sleep(2)
+                await client.connect()
+                if attempt == 1:
+                    await event.respond("Telegram Server Auth Error. Try again later.")
+                    del login_states[ADMIN_ID]
+            except Exception as e:
+                await event.respond(f"Error sending OTP: {e}")
+                del login_states[ADMIN_ID]
+                break
+
+    elif step == 'code':
+        client = state['client']
+        phone = state['phone']
+        phone_hash = state['hash']
+        api_id = state['api_id']
+        api_hash = state['api_hash']
+        try:
+            await client.sign_in(phone, text, phone_code_hash=phone_hash)
+            user_clients[phone] = client
+            if "account_credentials" not in app_data:
+                app_data["account_credentials"] = {}
+            app_data["account_credentials"][phone] = {"api_id": api_id, "api_hash": api_hash}
+            save_data()
+            await event.respond(f"Account {phone} Logged In Successfully!")
+            del login_states[ADMIN_ID]
+        except SessionPasswordNeededError:
+            login_states[ADMIN_ID] = {
+                'step': 'password', 
+                'client': client, 
+                'phone': phone, 
+                'api_id': api_id, 
+                'api_hash': api_hash
+            }
+            await event.respond("2-Step Verification Enabled!\n\nKripya apna Telegram 2FA Password bhejein:")
+        except Exception as e:
+            await event.respond(f"Login Failed: {e}")
+            del login_states[ADMIN_ID]
+
+    elif step == 'password':
+        client = state['client']
+        phone = state['phone']
+        api_id = state['api_id']
+        api_hash = state['api_hash']
+        try:
+            await client.sign_in(password=text)
+            user_clients[phone] = client
+            if "account_credentials" not in app_data:
+                app_data["account_credentials"] = {}
+            app_data["account_credentials"][phone] = {"api_id": api_id, "api_hash": api_hash}
+            save_data()
+            await event.respond(f"Account {phone} Logged In Successfully (2FA Passed)!")
+            del login_states[ADMIN_ID]
+        except Exception as e:
+            await event.respond(f"Password Incorrect ya Error: {e}")
+            del login_states[ADMIN_ID]
+
+    elif step == 'set_delay':
+        try:
+            parts = text.split()
+            app_data['min_delay'] = int(parts[0])
+            app_data['max_delay'] = int(parts[1]) if len(parts) > 1 else int(parts[0])
+            save_data()
+            await event.respond(f"Delay range set to {app_data['min_delay']}-{app_data['max_delay']} seconds.")
+        except Exception:
+            await event.respond("Format: 30 60.")
+        del login_states[ADMIN_ID]
+
+    elif step == 'set_cycle':
+        try:
+            app_data['cycle_interval'] = int(text)
+            save_data()
+            await event.respond(f"Cycle repeat set to {text} minutes.")
+        except Exception:
+            await event.respond("Please enter a valid number of minutes.")
+        del login_states[ADMIN_ID]
+
+    elif step == 'set_msg':
+        app_data['broadcast_msg'] = text
+        save_data()
+        await event.respond("Broadcast message saved!")
+        del login_states[ADMIN_ID]
+
+# --- INDEPENDENT ACCOUNT BROADCAST ENGINE ---
+
+async def run_single_account_broadcast(phone):
+    client = user_clients.get(phone)
+    if not client:
+        return
+
+    cycle_count = 0
+
+    while active_broadcasts.get(phone, False):
+        try:
+            msg = app_data.get('broadcast_msg')
+            cycle = app_data.get('cycle_interval', 60)
+            target_groups = app_data["account_groups"].get(phone, [])
+            min_d = app_data.get('min_delay', 30)
+            max_d = app_data.get('max_delay', 60)
+
+            if not msg or not target_groups:
+                await bot.send_message(ADMIN_ID, f"Account {phone} Broadcast Stopped: Message ya target groups missing hain.")
+                active_broadcasts[phone] = False
+                break
+
+            cycle_count += 1
+            successful_sends = 0
+            failed_sends = 0
+
+            # Iterate through each group exactly ONCE in this cycle
+            for group_id in target_groups:
+                if not active_broadcasts.get(phone, False):
+                    break
+                try:
+                    if not client.is_connected():
+                        await client.connect()
+                    
+                    await client.send_message(group_id, msg)
+                    successful_sends += 1
+
+                except FloodWaitError as e:
+                    await bot.send_message(ADMIN_ID, f"Account {phone} Limit Warning! Sleeping {e.seconds}s")
+                    await asyncio.sleep(e.seconds)
+                    failed_sends += 1
+                except Exception:
+                    failed_sends += 1
+
+                sleep_time = random.randint(min_d, max_d)
+                await asyncio.sleep(sleep_time)
+
+            # Send a summary message AFTER the cycle is completely finished
+            if active_broadcasts.get(phone, False):
+                summary = (
+                    f"Account {phone} - Cycle #{cycle_count} Finished!\n\n"
+                    f"Sent: {successful_sends} / {len(target_groups)} Groups\n"
+                    f"Failed: {failed_sends} Groups\n"
+                    f"Next cycle in {cycle} minutes..."
+                )
+                await bot.send_message(ADMIN_ID, summary)
+                await asyncio.sleep(cycle * 60)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            await bot.send_message(ADMIN_ID, f"Unexpected error in broadcast for {phone}: {e}")
+            await asyncio.sleep(30)
+
+# --- STARTUP ---
+
+async def main():
+    flask_thread = threading.Thread(target=run_flask_server, daemon=True)
+    flask_thread.start()
+    print("Flask Web Server started on background thread.")
+
+    # Reconnect stored user accounts
+    account_credentials = app_data.get("account_credentials", {})
+    default_api_id = app_data.get("api_id") or DEFAULT_BOT_API_ID
+    default_api_hash = app_data.get("api_hash") or DEFAULT_BOT_API_HASH
+
+    for f in os.listdir(SESSIONS_DIR):
+        if f.endswith('.session'):
+            phone = f.replace("acc_", "").replace(".session", "")
+            creds = account_credentials.get(phone, {})
+            api_id = creds.get("api_id") or default_api_id
+            api_hash = creds.get("api_hash") or default_api_hash
+
+            path = os.path.join(SESSIONS_DIR, f.replace('.session', ''))
+            c = TelegramClient(path, api_id, api_hash, auto_reconnect=True)
+            try:
+                await c.connect()
+                if await c.is_user_authorized():
+                    user_clients[phone] = c
+            except Exception as e:
+                print(f"Error loading session {f}: {e}")
+
+    print("Master Control Bot Running...")
+    await bot.start(bot_token=BOT_TOKEN)
+    await bot.run_until_disconnected()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
