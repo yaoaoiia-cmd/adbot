@@ -25,7 +25,7 @@ def run_flask_server():
 
 # --- CONFIGURATION & STORAGE ---
 # Only BOT_TOKEN and ADMIN_ID are required as environment variables.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8738394002:AAGJRJZGD_V8vJYLIM55ExVyqFAj-T1hVuE").strip()
+BOT_TOKEN = "8738394002:AAGJRJZGD_V8vJYLIM55ExVyqFAj-T1hVuE"
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "6905348308").strip()
 ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else 0
 
